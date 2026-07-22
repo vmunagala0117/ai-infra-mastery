@@ -406,6 +406,8 @@ other queued-up work to fall back on.
 | Arithmetic intensity | FLOPs performed ÷ bytes moved from/to memory — low values indicate memory-bound workloads |
 | Roofline model | Framework (to be formalized later) for reasoning about whether a kernel is memory-bound or compute-bound based on arithmetic intensity vs. hardware limits |
 | Tiling | Loading a reusable chunk of data into shared memory once so multiple threads can reuse it, instead of each re-fetching from global memory |
+| Kernel launch overhead | Fixed cost to dispatch a CUDA kernel (Python → driver → GPU queue), roughly constant regardless of data size — dominates measured time at small workload sizes |
+| Achieved bandwidth | Real-world bytes-moved ÷ time-taken for a kernel, vs. a GPU's theoretical peak bandwidth spec — typically 75-95% of peak depending on access pattern and problem size |
 
 ---
 
@@ -483,6 +485,108 @@ small amount of shared memory for a large reduction in global memory traffic,
 which raises arithmetic intensity and pushes a workload from memory-bound
 toward compute-bound. It's exactly what cuBLAS, cuDNN, and TensorRT do
 automatically under the hood in their "optimized" kernels vs. naive ones.
+
+### 9.5 Empirically Verified: Lab 01 Results (real T4 measurements)
+
+The floor calculated in 9.3 was theory. Here's what running it for real on the
+T4 actually showed (full details: `labs/phase0-gpu-cuda/01-vector-add-timing/`):
+
+| n | measured (min) | predicted floor | ratio | achieved bandwidth |
+|---|---|---|---|---|
+| 1,000,000 | 51.97 μs | 37.50 μs | 1.39x | ~231 GB/s (~72% of peak) |
+| 10,000,000 | 413.89 μs | 375.00 μs | 1.10x | ~290 GB/s (~91% of peak) |
+| 100,000,000 | 4031.04 μs | 3750.00 μs | 1.07x | ~298 GB/s (~93% of peak) |
+
+**Two new concepts this revealed, worth carrying forward:**
+
+- **Kernel launch overhead.** Every CUDA kernel dispatch (through
+  PyTorch → CUDA driver → GPU queue) carries a roughly constant fixed cost,
+  independent of data size. At small `n`, this is a meaningful fraction of
+  total time (1M elements: ~14 of 52 μs wasn't bandwidth-bound work at all).
+  At large `n`, it's amortized into irrelevance. **Practical implication:**
+  don't benchmark small workloads and expect to see hardware's advertised
+  numbers — you need enough work to move past fixed overhead first. This is
+  also part of the real justification for batching in production inference.
+- **Achieved vs. peak bandwidth.** Advertised bandwidth (320 GB/s on T4) is a
+  theoretical ceiling assuming ideal access patterns and zero overhead. Real
+  kernels typically reach ~75-95% of peak depending on access pattern and
+  problem size — computable directly as `bytes moved ÷ time taken`. This is
+  exactly the metric Nsight and other profilers report, and now you have a
+  hand-verified reference point for what "good" looks like on this specific
+  GPU for a simple streaming op.
+
+### 9.6 Understanding the Code: How `c = a + b` Actually Executes
+
+Two separate things are worth being able to explain clearly here: **how the
+host and GPU coordinate in time** (why we measure the way we do), and **what
+physically happens on the chip** once the instruction lands there.
+
+**Why CUDA events, not `time.time()`.** GPU kernel launches are
+**asynchronous** — when Python executes `c = a + b`, it hands the instruction
+to the GPU's queue and immediately moves on to the next line, without waiting
+for the GPU to actually finish. A normal CPU-side timer would mostly measure
+Python/OS overhead, not GPU work. `start.record()` and `end.record()` instead
+insert markers directly into the **GPU's own instruction stream**, so
+`elapsed_time()` reports true GPU-side duration, immune to host-side noise.
+`torch.cuda.synchronize()` is the host explicitly blocking until everything
+queued on the GPU has completed — needed once before timing (to pay one-time
+CUDA context/allocator warm-up costs untimed) and again after `end.record()`
+(since reading `elapsed_time()` requires both markers to have actually
+fired).
+
+```mermaid
+sequenceDiagram
+    participant Host as Host (Python/CPU)
+    participant Queue as GPU instruction queue
+    participant GPU as GPU execution
+
+    Host->>Queue: c = a + b  (launch — returns immediately)
+    Note over Host: Python continues immediately<br/>(kernel launch is async)
+    Host->>Queue: start.record()  (insert marker)
+    Host->>Queue: c = a + b  (launch)
+    Host->>Queue: end.record()  (insert marker)
+    Queue->>GPU: Execute in order: start marker → add kernel → end marker
+    Host->>GPU: torch.cuda.synchronize()  (blocks)
+    GPU-->>Host: all queued work complete
+    Host->>Host: elapsed_time() = end marker − start marker (true GPU-side duration)
+```
+
+**Why the minimum of 20 runs, not the average.** OS scheduling noise and
+allocator bookkeeping can only ever push a measurement *up*, never down. The
+fastest of many runs is the least-contaminated estimate of the true hardware
+floor.
+
+**What physically happens on the GPU for `c = a + b`.** This ties directly
+back to Sections 4-7: the grid scheduler distributes `n`-worth of threads
+(one per element) across the 40 SMs as thread blocks; each block splits into
+warps of 32; each partition's warp scheduler picks a ready warp and issues
+the add instruction to its 16 FP32 cores over the familiar two cycles; each
+thread reads its `a[i]` and `b[i]` from global memory (via L2), computes the
+sum (near-zero cost), and writes `c[i]` back out.
+
+```mermaid
+flowchart TD
+    A["Python: c = a + b<br/>(kernel launch, asynchronous)"] --> B["Grid scheduler<br/>distributes n threads across 40 SMs as blocks"]
+    B --> C["Each block splits into warps of 32 threads"]
+    C --> D["Partition's warp scheduler<br/>picks a ready warp"]
+    D --> E["Instruction issued to 16 FP32 cores<br/>2 cycles: threads 0-15, then 16-31"]
+    E --> F["Each thread reads a[i], b[i]<br/>from global memory via L2"]
+    F --> G["Core computes sum<br/>(trivial — near-zero cost)"]
+    G --> H["Write c[i] back to global memory via L2"]
+    H --> I["torch.cuda.synchronize()<br/>host waits for GPU queue to drain"]
+```
+
+**Why bandwidth prediction was the right lens here.** Because the arithmetic
+is trivial and the data movement is substantial, this kernel is almost
+entirely a test of how fast the GPU can shuttle bytes between GDDR6 and the
+cores. That's why comparing measured time against a *bandwidth-based*
+prediction — not a compute-based one — was the correct model, and why the
+close match (298 of 320 GB/s, ~93%) is genuine confirmation that the physical
+mental model of memory-bound execution matches real hardware behavior, not
+just a coincidence of round numbers. **A different kernel with real
+arithmetic — e.g. matrix multiply — would need a compute-bound prediction
+instead; recognizing which lens applies to a given kernel, before running it,
+is the actual skill this lab was building.**
 
 ## 10. Self-Check Exercises
 
